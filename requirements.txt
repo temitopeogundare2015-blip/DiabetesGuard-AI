@@ -1,6 +1,0 @@
-streamlit
-openai
-pandas
-numpy
-matplotlib
-python-dotenv
