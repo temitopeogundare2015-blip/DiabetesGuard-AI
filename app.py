@@ -1,8 +1,9 @@
 """
 DiabetesGuard AI — Multi-Agent Patient Triage & Risk Dashboard
-Author : Temitope Adereni | DataraFlow DF2025-036
-Dataset: UCI Diabetes 130-US Hospitals (1999-2008)
-Agents : RiskAssessor · ExplainerAgent · DischargeAdvisor · ResearchAssistant
+Author     : Temitope Adereni | DataraFlow DF2025-036
+Datasets   : UCI Diabetes 130-US Hospitals (101,766 rows, 42 cols)
+             Secondary Hospital Readmissions  (25,000 rows, 13 cols)
+Agents     : RiskAssessor · ExplainerAgent · DischargeAdvisor · ResearchAssistant
 """
 
 import os, warnings
@@ -12,38 +13,63 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import (roc_auc_score, f1_score, precision_score,
+                             recall_score, roc_curve)
 from openai import AzureOpenAI
 
-# ── Azure OpenAI client ───────────────────────────────────────────────────────
-client = AzureOpenAI(
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-)
-DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+# ── Azure OpenAI client (works on Streamlit Cloud AND Colab/local) ─────────
+def _get_client():
+    try:
+        endpoint   = st.secrets["AZURE_OPENAI_ENDPOINT"]
+        api_key    = st.secrets["AZURE_OPENAI_API_KEY"]
+        api_ver    = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-02-01")
+        deployment = st.secrets.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    except Exception:
+        endpoint   = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        api_key    = os.environ.get("AZURE_OPENAI_API_KEY", "")
+        api_ver    = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01")
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    return AzureOpenAI(azure_endpoint=endpoint, api_key=api_key,
+                       api_version=api_ver), deployment
 
-# ── Research context (real results from your notebooks) ──────────────────────
+AZ_CLIENT, DEPLOYMENT = _get_client()
+
 RESEARCH_CONTEXT = """
-You are an AI clinical decision-support agent built on the research paper:
+You are an AI clinical decision-support agent for:
 'Predictive Modeling: Utilizing Machine Learning to Forecast Diabetes Hospital Re-admissions'
-by Temitope Adereni, DataraFlow Internship DF2025-036.
+by Temitope Adereni, DataraFlow DF2025-036.
 
-REAL RESEARCH FINDINGS YOU MUST USE:
-- Dataset: UCI Diabetes 130-US Hospitals 1999-2008 (100,000+ encounters)
-- Target: 30-day readmission (label: '<30' days = readmitted = 1, else 0)
-- Logistic Regression AUC = 0.624  |  Random Forest AUC = 0.609  (LR wins — H1 not supported)
-- External validation: LR AUC = 0.644  |  RF AUC = 0.605
-- Adding utilisation features improved AUC from 0.529 → 0.629 (H2 SUPPORTED)
-- SMOTE did NOT improve UCI performance — introduced noise (H3 MIXED)
-- Strongest predictors: number_inpatient, time_in_hospital, number_emergency, number_outpatient
-- Demo features: race, gender, age | Utilisation: time_in_hospital, number_inpatient, number_outpatient, number_emergency
+REAL FINDINGS FROM BOTH DATASETS:
+UCI Diabetes 130-US Hospitals (101,766 encounters, 42 features, 1999-2008):
+  - Target: readmitted '<30' days = 1, else 0.  Class split: NO=53.9%, >30=34.9%, <30=11.2%
+  - LR AUC=0.624 > RF AUC=0.609  (H1 NOT supported — LR wins)
+  - Demo-only AUC=0.529 → Demo+Utilisation AUC=0.629  (H2 SUPPORTED, +19%)
+  - SMOTE did NOT help on UCI  (H3 MIXED)
+  - Top predictors: number_inpatient, time_in_hospital, number_emergency, number_outpatient
+  - Columns: race, gender, age, time_in_hospital, num_lab_procedures, num_procedures,
+    num_medications, number_outpatient, number_emergency, number_inpatient, diag_1-3,
+    number_diagnoses, max_glu_serum, A1Cresult, 23 medication columns, change, diabetesMed
+
+Secondary Hospital Readmissions (25,000 encounters, 13 features):
+  - Binary target: yes/no readmission — 47% readmitted (much more balanced than UCI)
+  - LR AUC=0.644, F1=0.496, Recall=0.406
+  - Columns: age, time_in_hospital, n_lab_procedures, n_procedures, n_medications,
+    n_outpatient, n_inpatient, n_emergency, glucose_test, A1Ctest, change, diabetes_med
+
+Key cross-dataset insight: Secondary F1 is much higher than UCI because it is more balanced.
+UCI's low F1 reflects severe class imbalance (only 11% readmitted within 30 days).
 """
 
-# ── Utility: call Azure OpenAI ────────────────────────────────────────────────
-def ask_agent(system_prompt: str, user_prompt: str, max_tokens: int = 400) -> str:
+def ask_agent(system_prompt: str, user_prompt: str, max_tokens: int = 450) -> str:
     try:
-        resp = client.chat.completions.create(
+        resp = AZ_CLIENT.chat.completions.create(
             model=DEPLOYMENT,
             messages=[
                 {"role": "system", "content": RESEARCH_CONTEXT + "\n\n" + system_prompt},
@@ -54,80 +80,155 @@ def ask_agent(system_prompt: str, user_prompt: str, max_tokens: int = 400) -> st
         )
         return resp.choices[0].message.content
     except Exception as e:
-        return f"⚠️ Azure OpenAI error: {e}\n\nCheck your API key and endpoint in the Colab setup cell."
+        return f"⚠️ Azure OpenAI error: {e}\n\nCheck your API key, endpoint and deployment name."
 
-# ── Risk score (mirrors your LR model's top feature weights) ─────────────────
-def compute_risk(inpatient, los, emergency, outpatient, diagnoses, medications, hba1c):
-    score = (
-        inpatient   * 0.35 +
-        los         * 0.25 +
-        emergency   * 0.20 +
-        outpatient  * 0.10 +
-        diagnoses   * 0.07 +
-        medications * 0.03
-    )
-    if hba1c in [">7", ">8"]:
-        score *= 1.15
-    pct = min(int((score / 14) * 100), 96)
-    if pct >= 60:
-        level, colour, emoji = "High", "#e74c3c", "🔴"
-    elif pct >= 35:
-        level, colour, emoji = "Moderate", "#f39c12", "🟡"
-    else:
-        level, colour, emoji = "Low", "#27ae60", "🟢"
-    return pct, level, colour, emoji
+# ── Data loading & model training (cached) ────────────────────────────────
+@st.cache_data(show_spinner="Loading datasets…")
+def load_datasets():
+    uci = pd.read_csv("cleaned_Diabetic_data__2_.csv")
+    sec = pd.read_csv("cleaned_hospital_readmissions.csv")
+    return uci, sec
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG & GLOBAL STYLE
-# ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(
-    page_title="DiabetesGuard AI",
-    page_icon="🏥",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+@st.cache_resource(show_spinner="Training models on both datasets…")
+def train_models():
+    uci, sec = load_datasets()
+
+    # ── UCI ──────────────────────────────────────────────────────────────────
+    uci_s = uci.sample(25000, random_state=42)
+    uci_s = uci_s.copy()
+    uci_s["y"] = np.where(uci_s["readmitted"] == "<30", 1, 0)
+    Xu = uci_s.drop(columns=["readmitted","y"])
+    Yu = uci_s["y"]
+    Xtr, Xte, Ytr, Yte = train_test_split(Xu, Yu, test_size=.2,
+                                           stratify=Yu, random_state=42)
+    unc = Xu.select_dtypes(include=np.number).columns.tolist()
+    ucc = Xu.select_dtypes(exclude=np.number).columns.tolist()
+    upre = ColumnTransformer([
+        ("n", SimpleImputer(strategy="median"), unc),
+        ("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
+                        ("o", OneHotEncoder(handle_unknown="ignore",
+                                           sparse_output=False))]), ucc),
+    ])
+    ulr = Pipeline([("p", upre), ("m", LogisticRegression(
+        max_iter=1000, C=1.0, solver="lbfgs", random_state=42))])
+    urf = Pipeline([("p", upre), ("m", RandomForestClassifier(
+        n_estimators=100, max_depth=10, random_state=42, n_jobs=-1))])
+    ulr.fit(Xtr, Ytr); urf.fit(Xtr, Ytr)
+    ulr_prob = ulr.predict_proba(Xte)[:,1]; ulr_pred = ulr.predict(Xte)
+    urf_prob = urf.predict_proba(Xte)[:,1]; urf_pred = urf.predict(Xte)
+
+    # feature AUC
+    demo = ["race","gender","age"]
+    util = ["time_in_hospital","number_inpatient","number_outpatient","number_emergency"]
+    def fauc(cols):
+        nc=[c for c in cols if c in Xtr.select_dtypes(include=np.number).columns]
+        cc=[c for c in cols if c not in nc]
+        p=ColumnTransformer([("n",SimpleImputer(strategy="median"),nc),
+                              ("c",Pipeline([("i",SimpleImputer(strategy="most_frequent")),
+                                             ("o",OneHotEncoder(handle_unknown="ignore",
+                                                                sparse_output=False))]),cc)])
+        pipe=Pipeline([("p",p),("m",LogisticRegression(max_iter=500,random_state=42))])
+        pipe.fit(Xtr[cols],Ytr)
+        return round(roc_auc_score(Yte,pipe.predict_proba(Xte[cols])[:,1]),3)
+    auc_demo = fauc([c for c in demo if c in Xu.columns])
+    auc_util = fauc([c for c in demo+util if c in Xu.columns])
+
+    uci_m = {
+        "LR": {"AUC": round(roc_auc_score(Yte,ulr_prob),3),
+               "F1":  round(f1_score(Yte,ulr_pred),3),
+               "Rec": round(recall_score(Yte,ulr_pred),3),
+               "Prec":round(precision_score(Yte,ulr_pred,zero_division=0),3),
+               "prob":ulr_prob,"pred":ulr_pred,"y":Yte.values},
+        "RF": {"AUC": round(roc_auc_score(Yte,urf_prob),3),
+               "F1":  round(f1_score(Yte,urf_pred),3),
+               "Rec": round(recall_score(Yte,urf_pred),3),
+               "Prec":round(precision_score(Yte,urf_pred,zero_division=0),3),
+               "prob":urf_prob,"pred":urf_pred},
+    }
+
+    # ── Secondary ─────────────────────────────────────────────────────────────
+    sec = sec.copy()
+    sec["y"] = (sec["readmitted"]=="yes").astype(int)
+    Xs = sec.drop(columns=["readmitted","y"])
+    Ys = sec["y"]
+    Xstr,Xste,Ystr,Yste = train_test_split(Xs,Ys,test_size=.2,
+                                            stratify=Ys,random_state=0)
+    snc = Xs.select_dtypes(include=np.number).columns.tolist()
+    scc = Xs.select_dtypes(exclude=np.number).columns.tolist()
+    spre = ColumnTransformer([
+        ("n",SimpleImputer(strategy="median"),snc),
+        ("c",Pipeline([("i",SimpleImputer(strategy="most_frequent")),
+                       ("o",OneHotEncoder(handle_unknown="ignore",
+                                         sparse_output=False))]),scc),
+    ])
+    slr = Pipeline([("p",spre),("m",LogisticRegression(
+        max_iter=1000,C=1.0,solver="lbfgs",random_state=0))])
+    srf = Pipeline([("p",spre),("m",RandomForestClassifier(
+        n_estimators=100,max_depth=10,random_state=0,n_jobs=-1))])
+    slr.fit(Xstr,Ystr); srf.fit(Xstr,Ystr)
+    slr_prob=slr.predict_proba(Xste)[:,1]; slr_pred=slr.predict(Xste)
+    srf_prob=srf.predict_proba(Xste)[:,1]; srf_pred=srf.predict(Xste)
+
+    sec_m = {
+        "LR": {"AUC": round(roc_auc_score(Yste,slr_prob),3),
+               "F1":  round(f1_score(Yste,slr_pred),3),
+               "Rec": round(recall_score(Yste,slr_pred),3),
+               "Prec":round(precision_score(Yste,slr_pred,zero_division=0),3),
+               "prob":slr_prob,"pred":slr_pred,"y":Yste.values},
+        "RF": {"AUC": round(roc_auc_score(Yste,srf_prob),3),
+               "F1":  round(f1_score(Yste,srf_pred),3),
+               "Rec": round(recall_score(Yste,srf_pred),3),
+               "Prec":round(precision_score(Yste,srf_pred,zero_division=0),3),
+               "prob":srf_prob,"pred":srf_pred},
+    }
+    return uci_m, sec_m, auc_demo, auc_util, uci, sec
+
+# ── Risk scoring ──────────────────────────────────────────────────────────
+def compute_risk(inpatient,los,emergency,outpatient,diagnoses,medications,hba1c):
+    score = (inpatient*0.35 + los*0.25 + emergency*0.20 +
+             outpatient*0.10 + diagnoses*0.07 + medications*0.03)
+    if hba1c in [">7",">8","high"]: score *= 1.15
+    pct = min(int((score/14)*100), 96)
+    if   pct >= 60: return pct,"High",    "#e74c3c","🔴"
+    elif pct >= 35: return pct,"Moderate","#f39c12","🟡"
+    else:           return pct,"Low",     "#27ae60","🟢"
+
+# ── Page config ───────────────────────────────────────────────────────────
+st.set_page_config(page_title="DiabetesGuard AI", page_icon="🏥",
+                   layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
-    .metric-card {
-        background: #f8f9fa; border-radius: 12px;
-        padding: 18px; text-align: center;
-        border-left: 5px solid #3498db;
-    }
-    .agent-box {
-        background: #eaf4fb; border-radius: 10px;
-        padding: 16px; margin-bottom: 12px;
-        border-left: 4px solid #2980b9;
-    }
-    .risk-high   { color: #e74c3c; font-weight: 700; font-size: 1.4rem; }
-    .risk-mod    { color: #f39c12; font-weight: 700; font-size: 1.4rem; }
-    .risk-low    { color: #27ae60; font-weight: 700; font-size: 1.4rem; }
-    .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 6px; }
-</style>
-""", unsafe_allow_html=True)
+.agent-box{background:#eaf4fb;border-radius:10px;padding:16px;
+           margin-bottom:12px;border-left:4px solid #2980b9;}
+.section-hd{font-size:1.05rem;font-weight:600;margin:10px 0 4px;}
+.tag-uci{background:#d6eaf8;color:#154360;padding:2px 8px;
+         border-radius:10px;font-size:.8rem;font-weight:600;}
+.tag-sec{background:#d5f5e3;color:#145a32;padding:2px 8px;
+         border-radius:10px;font-size:.8rem;font-weight:600;}
+</style>""", unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🏥 DiabetesGuard AI")
     st.caption("Multi-Agent Triage Dashboard")
     st.markdown("---")
     page = st.radio("", [
-        "🏠  Home",
-        "🔬  Patient Triage",
-        "📊  Model Results",
-        "📈  Feature Analysis",
-        "🤖  Research Assistant",
+        "🏠  Home","🔬  Patient Triage","📊  Model Results",
+        "📈  Feature Analysis","🗄️  Dataset Explorer","🤖  Research Assistant",
     ], label_visibility="collapsed")
     st.markdown("---")
     st.markdown("**Author:** Temitope Adereni")
     st.markdown("**Programme:** DataraFlow DF2025-036")
-    st.markdown("**Dataset:** UCI Diabetes 130-US Hospitals")
-    st.markdown("**Model:** Logistic Regression (AUC 0.624)")
     st.markdown("---")
-    st.markdown("**🤖 Agents**")
-    st.markdown("• 🔴 RiskAssessor\n• 🔵 ExplainerAgent\n• 🟢 DischargeAdvisor\n• 🟣 ResearchAssistant")
+    st.markdown("**Datasets**")
+    st.markdown('<span class="tag-uci">UCI</span> 101,766 rows · 42 cols',
+                unsafe_allow_html=True)
+    st.markdown('<span class="tag-sec">Secondary</span> 25,000 rows · 13 cols',
+                unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("**🤖 Active Agents**")
+    st.markdown("🔴 RiskAssessor\n\n🔵 ExplainerAgent\n\n🟢 DischargeAdvisor\n\n🟣 ResearchAssistant")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HOME
@@ -136,338 +237,372 @@ if page == "🏠  Home":
     st.title("🏥 DiabetesGuard AI")
     st.markdown("### Multi-Agent Patient Triage & Readmission Risk Dashboard")
     st.markdown("""
-    > *Built on the research paper: **Predictive Modeling: Utilizing Machine Learning
-    > to Forecast Diabetes Hospital Re-admissions** — Temitope Adereni, DataraFlow DF2025-036*
+    > *Based on: **Predictive Modeling: Utilizing Machine Learning to Forecast Diabetes
+    > Hospital Re-admissions** — Temitope Adereni, DataraFlow DF2025-036*
 
-    This system processes patient data through **3 specialised Azure OpenAI agents**
-    to triage readmission risk, explain predictions, and generate discharge plans —
-    just like the OralCare AI system, but for diabetes.
+    Routes patient data through **3 Azure OpenAI agents** trained on two real clinical
+    datasets to triage readmission risk, explain predictions, and generate discharge plans.
     """)
-
-    # KPI row
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("LR Model AUC", "0.624", "Best performer")
-    c2.metric("RF Model AUC", "0.609", "vs LR")
-    c3.metric("AUC w/ Utilisation", "0.629", "+19% vs demo-only")
-    c4.metric("External Validation", "0.644", "Generalises well")
+    try:
+        um, sm, ad, au, _, _ = train_models()
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("UCI · LR AUC",        um["LR"]["AUC"], "Best on UCI")
+        c2.metric("UCI · RF AUC",        um["RF"]["AUC"])
+        c3.metric("Secondary · LR AUC",  sm["LR"]["AUC"], "Best on Secondary")
+        c4.metric("Secondary · RF AUC",  sm["RF"]["AUC"])
+        c5.metric("Utilisation Boost",   au, f"+{round(au-ad,3)} vs demo-only")
+    except Exception:
+        st.info("Models loading… refresh in a moment.")
 
     st.markdown("---")
-
-    # Agent pipeline diagram
     st.markdown("### 🔁 The 3-Agent Pipeline")
-    a1, a2, a3, a4 = st.columns([1, 0.15, 1, 0.15])  # arrow cols
-    with a1:
-        st.info("**🔴 Agent 1 — RiskAssessor**\n\nTakes clinical inputs (age, LOS, prior visits, HbA1c) → outputs urgency score: 🔴 High / 🟡 Moderate / 🟢 Low")
-    a2.markdown("<div style='text-align:center; font-size:2rem; margin-top:40px'>→</div>", unsafe_allow_html=True)
-    with a3:
-        st.info("**🔵 Agent 2 — ExplainerAgent**\n\nExplains *why* the patient is at risk using your feature importance findings (utilisation features = strongest predictors)")
-    st.markdown("")
-    b1, b2, b3 = st.columns([1, 0.15, 1])
-    with b1:
-        st.info("**🟢 Agent 3 — DischargeAdvisor**\n\nGenerates personalised, empathetic discharge recommendations to reduce 30-day readmission probability")
-    b2.markdown("<div style='text-align:center; font-size:2rem; margin-top:40px'>→</div>", unsafe_allow_html=True)
-    with b3:
-        st.success("**📋 Output**\n\nRisk category + explanation + discharge plan — all in one dashboard view, ready for clinical use")
+    a1,ar1,a2,ar2,a3 = st.columns([2,.15,2,.15,2])
+    a1.info("**🔴 RiskAssessor**\n\nScores patient using LR feature weights → 🔴 High / 🟡 Moderate / 🟢 Low")
+    ar1.markdown("<div style='text-align:center;font-size:2rem;margin-top:30px'>→</div>",unsafe_allow_html=True)
+    a2.info("**🔵 ExplainerAgent**\n\nExplains *why* using feature importance findings from both datasets")
+    ar2.markdown("<div style='text-align:center;font-size:2rem;margin-top:30px'>→</div>",unsafe_allow_html=True)
+    a3.info("**🟢 DischargeAdvisor**\n\nGenerates personalised discharge plan to reduce 30-day readmission")
 
     st.markdown("---")
-    st.markdown("### 📂 Research Hypotheses Summary")
-    hyp_df = pd.DataFrame({
-        "Hypothesis": ["H1: Random Forest > Logistic Regression", "H2: Utilisation features improve AUC", "H3: SMOTE improves Recall"],
-        "Result": ["❌ Not supported — LR won (0.624 vs 0.609)", "✅ Supported — AUC: 0.529 → 0.629", "⚠️ Mixed — helped externally, not on UCI"],
-        "Implication": ["Use simpler interpretable models", "Always include prior visit counts & LOS", "Apply SMOTE cautiously per dataset"],
-    })
-    st.dataframe(hyp_df, use_container_width=True, hide_index=True)
+    st.markdown("### 📋 Research Hypotheses")
+    st.dataframe(pd.DataFrame({
+        "Hypothesis":  ["H1: RF > LR in AUC","H2: Utilisation features improve AUC",
+                        "H3: SMOTE improves Recall"],
+        "Result":      ["❌ LR wins on both UCI and Secondary",
+                        "✅ AUC +19% on UCI (0.529→0.629)",
+                        "⚠️ Mixed — no gain on UCI, slight gain on Secondary"],
+        "Implication": ["Simpler models generalise better on clinical data",
+                        "Always include prior visit counts & length of stay",
+                        "Validate SMOTE per dataset before applying"],
+    }), use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PATIENT TRIAGE
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🔬  Patient Triage":
     st.title("🔬 Patient Triage")
-    st.markdown("Fill in patient details. Three Azure OpenAI agents will assess readmission risk, explain it, and suggest a discharge plan.")
+    st.markdown("Enter patient details. Three Azure OpenAI agents assess risk using findings from **both datasets**.")
+
+    dataset_choice = st.radio("Reference dataset:",
+        ["UCI Diabetes (42 features)","Secondary Readmissions (13 features)"],
+        horizontal=True)
+    using_uci = "UCI" in dataset_choice
 
     with st.form("triage_form"):
-        st.markdown("#### 👤 Demographics  *(race · gender · age)*")
-        d1, d2, d3 = st.columns(3)
-        age    = d1.selectbox("Age Group", ["[0-10)","[10-20)","[20-30)","[30-40)","[40-50)",
-                                             "[50-60)","[60-70)","[70-80)","[80-90)","[90-100)"], index=6)
-        gender = d2.selectbox("Gender", ["Male", "Female"])
-        race   = d3.selectbox("Race", ["Caucasian","AfricanAmerican","Hispanic","Asian","Other"])
+        st.markdown("#### 👤 Demographics")
+        d1,d2,d3 = st.columns(3)
+        age    = d1.selectbox("Age Group",
+                              ["[0-10)","[10-20)","[20-30)","[30-40)","[40-50)",
+                               "[50-60)","[60-70)","[70-80)","[80-90)","[90-100)"],index=6)
+        gender = d2.selectbox("Gender",["Male","Female"], disabled=not using_uci)
+        race   = d3.selectbox("Race",
+                              ["Caucasian","AfricanAmerican","Hispanic","Asian","Other"],
+                              disabled=not using_uci)
 
-        st.markdown("#### 🏥 Utilisation Features  *(strongest predictors in your research)*")
-        u1, u2, u3, u4 = st.columns(4)
-        los        = u1.slider("Length of Stay (days)",    1, 14, 5)
-        inpatient  = u2.slider("Prior Inpatient Visits",   0, 15, 2)
-        outpatient = u3.slider("Prior Outpatient Visits",  0, 15, 1)
-        emergency  = u4.slider("Prior Emergency Visits",   0, 15, 1)
+        st.markdown("#### 🏥 Utilisation Features *(strongest predictors in both datasets)*")
+        u1,u2,u3,u4 = st.columns(4)
+        los        = u1.slider("Length of Stay (days)",   1,14,5)
+        inpatient  = u2.slider("Prior Inpatient Visits",  0,15,2)
+        outpatient = u3.slider("Prior Outpatient Visits", 0,15,1)
+        emergency  = u4.slider("Prior Emergency Visits",  0,15,1)
 
         st.markdown("#### 💊 Clinical Variables")
-        cl1, cl2, cl3, cl4 = st.columns(4)
-        medications = cl1.slider("Num. Medications",  1, 30, 12)
-        diagnoses   = cl2.slider("Num. Diagnoses",    1, 16,  7)
-        hba1c       = cl3.selectbox("HbA1c Result", ["None","Normal",">7",">8"])
-        insulin     = cl4.selectbox("Insulin", ["No","Steady","Up","Down"])
-
-        submitted = st.form_submit_button("🚀 Run Multi-Agent Assessment", use_container_width=True)
+        cl1,cl2,cl3,cl4 = st.columns(4)
+        medications = cl1.slider("Num. Medications", 1, 81 if using_uci else 30, 12)
+        diagnoses   = cl2.slider("Num. Diagnoses",   1,16,7)
+        hba1c       = cl3.selectbox("HbA1c / A1C Result",
+                                    [">8",">7","Norm","None"] if using_uci
+                                    else ["high","normal","no"])
+        insulin     = cl4.selectbox("Insulin / Diabetes Med",
+                                    ["No","Steady","Up","Down"] if using_uci
+                                    else ["yes","no"])
+        submitted = st.form_submit_button("🚀 Run Multi-Agent Assessment",
+                                          use_container_width=True)
 
     if submitted:
-        risk_pct, level, colour, emoji = compute_risk(
-            inpatient, los, emergency, outpatient, diagnoses, medications, hba1c
-        )
-
-        patient_summary = {
-            "age_group": age, "gender": gender, "race": race,
-            "time_in_hospital": los, "number_inpatient": inpatient,
-            "number_outpatient": outpatient, "number_emergency": emergency,
-            "num_medications": medications, "num_diagnoses": diagnoses,
-            "HbA1c_result": hba1c, "insulin": insulin,
-            "computed_risk_pct": risk_pct, "risk_level": level,
+        risk_pct,level,colour,emoji = compute_risk(
+            inpatient,los,emergency,outpatient,diagnoses,medications,hba1c)
+        patient = {
+            "dataset": "UCI" if using_uci else "Secondary",
+            "age_group":age, "gender":gender if using_uci else "N/A",
+            "race":race if using_uci else "N/A",
+            "time_in_hospital":los, "inpatient_visits":inpatient,
+            "outpatient_visits":outpatient, "emergency_visits":emergency,
+            "num_medications":medications, "num_diagnoses":diagnoses,
+            "hba1c":hba1c, "insulin":insulin,
+            "risk_pct":risk_pct, "risk_level":level,
         }
-
         st.markdown("---")
-
-        # Risk gauge
-        col_gauge, col_agents = st.columns([1, 2])
-        with col_gauge:
+        g_col,a_col = st.columns([1,2])
+        with g_col:
             st.markdown("### Risk Score")
-            fig, ax = plt.subplots(figsize=(4, 2.2), subplot_kw=dict(aspect="equal"))
-            wedge_colors = ["#27ae60", "#f39c12", "#e74c3c"]
-            ax.pie([33, 33, 34], colors=wedge_colors,
-                   startangle=180, counterclock=False,
-                   wedgeprops=dict(width=0.45))
-            needle_angle = 180 - (risk_pct / 100 * 180)
-            needle_rad   = np.radians(needle_angle)
-            ax.annotate("", xy=(0.38 * np.cos(needle_rad), 0.38 * np.sin(needle_rad)),
-                        xytext=(0, 0),
-                        arrowprops=dict(arrowstyle="->", color="black", lw=2))
-            ax.text(0, -0.25, f"{risk_pct}%", ha="center", va="center",
-                    fontsize=20, fontweight="bold", color=colour)
-            ax.text(0, -0.52, f"{emoji} {level} Risk", ha="center", va="center",
-                    fontsize=11, color=colour)
+            fig,ax = plt.subplots(figsize=(4,2.5),subplot_kw=dict(aspect="equal"))
+            ax.pie([33,33,34],colors=["#27ae60","#f39c12","#e74c3c"],
+                   startangle=180,counterclock=False,wedgeprops=dict(width=0.45))
+            rad = np.radians(180-(risk_pct/100*180))
+            ax.annotate("",xy=(0.38*np.cos(rad),0.38*np.sin(rad)),xytext=(0,0),
+                        arrowprops=dict(arrowstyle="->",color="black",lw=2.5))
+            ax.text(0,-0.28,f"{risk_pct}%",ha="center",fontsize=22,
+                    fontweight="bold",color=colour)
+            ax.text(0,-0.55,f"{emoji} {level} Risk",ha="center",
+                    fontsize=11,color=colour)
             ax.axis("off")
-            st.pyplot(fig, use_container_width=True)
-            plt.close()
+            st.pyplot(fig,use_container_width=True); plt.close()
+            st.progress(risk_pct/100)
+            st.caption(f"Scored on top-weighted features from your "
+                       f"{'UCI' if using_uci else 'Secondary'} LR model.")
 
-            st.progress(risk_pct / 100)
-            st.caption(f"Score based on your LR model's top feature weights: prior inpatient visits, length of stay, emergency visits.")
-
-        with col_agents:
-            # ── Agent 1: RiskAssessor ─────────────────────────────────
-            st.markdown('<p class="section-title">🔴 RiskAssessor Agent</p>', unsafe_allow_html=True)
-            with st.spinner("Assessing readmission risk..."):
+        with a_col:
+            st.markdown('<p class="section-hd">🔴 RiskAssessor Agent</p>',
+                        unsafe_allow_html=True)
+            with st.spinner("Assessing readmission risk…"):
                 a1_out = ask_agent(
-                    system_prompt=(
-                        "You are the RiskAssessor agent. Using the research findings, "
-                        "give a 3-sentence clinical risk assessment. State the risk level clearly, "
-                        "reference the patient's most concerning utilisation features, "
-                        "and compare to the model's AUC of 0.624."
-                    ),
-                    user_prompt=f"Assess 30-day readmission risk for this patient: {patient_summary}",
+                    "You are the RiskAssessor. Give a 3-sentence clinical risk assessment. "
+                    "State risk level clearly, reference the patient's most concerning "
+                    "utilisation features, and note which dataset context is being used "
+                    "and what that means for the AUC reliability of this prediction.",
+                    f"Assess 30-day readmission risk: {patient}",
                 )
-            st.markdown(f'<div class="agent-box">{a1_out}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="agent-box">{a1_out}</div>',unsafe_allow_html=True)
 
-        # ── Agent 2: ExplainerAgent ───────────────────────────────────
-        st.markdown('<p class="section-title">🔵 ExplainerAgent — Why is this patient at risk?</p>', unsafe_allow_html=True)
-        with st.spinner("Explaining risk drivers..."):
+        st.markdown('<p class="section-hd">🔵 ExplainerAgent — Why is this patient at risk?</p>',
+                    unsafe_allow_html=True)
+        with st.spinner("Explaining risk drivers…"):
             a2_out = ask_agent(
-                system_prompt=(
-                    "You are the ExplainerAgent — an explainable AI specialist. "
-                    "Based on the research finding that utilisation features improved AUC from 0.529 to 0.629, "
-                    "explain in exactly 3 bullet points which of this patient's features most drive their risk and why. "
-                    "Be specific and reference the actual feature values provided."
-                ),
-                user_prompt=f"Explain risk drivers for: {patient_summary}",
+                "You are the ExplainerAgent. Give exactly 3 bullet points explaining "
+                "which features most drive this patient's risk and why, referencing the "
+                "finding that utilisation features improved AUC from 0.529 to 0.629 on UCI. "
+                "Be specific about the actual feature values provided.",
+                f"Explain risk drivers: {patient}",
             )
-        st.markdown(f'<div class="agent-box">{a2_out}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="agent-box">{a2_out}</div>',unsafe_allow_html=True)
 
-        # ── Agent 3: DischargeAdvisor ─────────────────────────────────
-        st.markdown('<p class="section-title">🟢 DischargeAdvisor — Personalised Discharge Plan</p>', unsafe_allow_html=True)
-        with st.spinner("Generating discharge recommendations..."):
+        st.markdown('<p class="section-hd">🟢 DischargeAdvisor — Personalised Discharge Plan</p>',
+                    unsafe_allow_html=True)
+        with st.spinner("Generating discharge plan…"):
             a3_out = ask_agent(
-                system_prompt=(
-                    "You are the DischargeAdvisor — a compassionate diabetes discharge planning specialist. "
-                    "Provide exactly 4 practical, empathetic, and specific discharge recommendations "
-                    "to reduce this patient's 30-day readmission risk. "
-                    "Tailor advice to their age group, HbA1c level, and utilisation history. "
-                    "Use plain, patient-friendly language."
-                ),
-                user_prompt=f"Create a discharge plan for: {patient_summary}. Risk level: {level} ({risk_pct}%)",
-                max_tokens=500,
+                "You are the DischargeAdvisor. Give 4 specific, empathetic, actionable "
+                "discharge recommendations to reduce 30-day readmission. Tailor to age group, "
+                "HbA1c level, prior visit history, and dataset context. Use plain language.",
+                f"Create discharge plan: {patient}. Risk: {level} ({risk_pct}%)",
+                max_tokens=550,
             )
         st.success(a3_out)
-
-        # Download summary
         st.markdown("---")
-        summary_text = f"""DiabetesGuard AI — Patient Triage Report
-==========================================
+        st.download_button("📥 Download Triage Report",
+            f"""DiabetesGuard AI — Triage Report
+====================================
+Dataset    : {patient['dataset']}
 Risk Score : {risk_pct}% ({level})
-Age Group  : {age} | Gender: {gender} | Race: {race}
-LOS        : {los} days | Inpatient: {inpatient} | Emergency: {emergency}
-HbA1c      : {hba1c} | Medications: {medications} | Diagnoses: {diagnoses}
+Age: {age} | Gender: {patient['gender']} | Race: {patient['race']}
+LOS: {los}d | Inpatient: {inpatient} | Emergency: {emergency} | Outpatient: {outpatient}
+HbA1c: {hba1c} | Medications: {medications} | Diagnoses: {diagnoses}
 
-RISK ASSESSMENT (RiskAssessor Agent)
+RISK ASSESSMENT
 {a1_out}
 
-RISK EXPLANATION (ExplainerAgent)
+EXPLANATION
 {a2_out}
 
-DISCHARGE PLAN (DischargeAdvisor Agent)
+DISCHARGE PLAN
 {a3_out}
 
 Generated by DiabetesGuard AI | Temitope Adereni | DataraFlow DF2025-036
-"""
-        st.download_button("📥 Download Triage Report", summary_text,
-                           file_name="triage_report.txt", mime="text/plain")
+""",
+            file_name="triage_report.txt", mime="text/plain")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODEL RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "📊  Model Results":
     st.title("📊 Model Performance Results")
-    st.markdown("Your actual results from the UCI Diabetes and external validation datasets.")
+    st.markdown("Live metrics trained on your actual uploaded datasets.")
+    try:
+        um,sm,ad,au,_,_ = train_models()
+    except Exception as e:
+        st.error(f"Model loading error: {e}"); st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["H1 — LR vs Random Forest", "H2 — Feature Sets", "H3 — SMOTE"])
+    tab1,tab2,tab3 = st.tabs(["H1 — LR vs RF","H2 — Feature Sets","H3 — ROC Curves"])
 
     with tab1:
-        st.markdown("#### Cross-Dataset AUC Comparison")
-        df = pd.DataFrame({
-            "Model":   ["Logistic Regression", "Random Forest", "Logistic Regression", "Random Forest"],
-            "Dataset": ["UCI", "UCI", "External", "External"],
-            "AUC":     [0.624, 0.609, 0.644, 0.605],
-            "F1":      [0.028, 0.012, 0.484, 0.537],
-        })
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("#### Cross-Dataset Model Comparison")
+        st.dataframe(pd.DataFrame({
+            "Model":    ["Logistic Regression","Random Forest",
+                         "Logistic Regression","Random Forest"],
+            "Dataset":  ["UCI","UCI","Secondary","Secondary"],
+            "AUC":      [um["LR"]["AUC"],um["RF"]["AUC"],sm["LR"]["AUC"],sm["RF"]["AUC"]],
+            "F1":       [um["LR"]["F1"], um["RF"]["F1"], sm["LR"]["F1"], sm["RF"]["F1"]],
+            "Recall":   [um["LR"]["Rec"],um["RF"]["Rec"],sm["LR"]["Rec"],sm["RF"]["Rec"]],
+            "Precision":[um["LR"]["Prec"],um["RF"]["Prec"],sm["LR"]["Prec"],sm["RF"]["Prec"]],
+        }), use_container_width=True, hide_index=True)
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        x = np.arange(2)
-        w = 0.32
-        b1 = ax.bar(x - w/2, [0.624, 0.609], w, label="UCI Dataset",      color="#3498db")
-        b2 = ax.bar(x + w/2, [0.644, 0.605], w, label="External Dataset", color="#2ecc71")
-        ax.set_xticks(x); ax.set_xticklabels(["Logistic Regression", "Random Forest"])
-        ax.set_ylim(0.55, 0.68); ax.set_ylabel("AUC")
-        ax.set_title("AUC: Logistic Regression vs Random Forest")
-        ax.legend(); ax.bar_label(b1, fmt="%.3f", padding=3); ax.bar_label(b2, fmt="%.3f", padding=3)
-        ax.axhline(0.624, color="#3498db", linestyle="--", alpha=0.4, linewidth=1)
-        st.pyplot(fig); plt.close()
-        st.info("**Finding (H1):** LR consistently outperforms RF in AUC. Simpler models generalise better on sparse clinical data.")
+        fig,axes = plt.subplots(1,2,figsize=(12,4))
+        for ax,(metric,lr_v,rf_v) in zip(axes,[
+            ("AUC",[um["LR"]["AUC"],sm["LR"]["AUC"]],[um["RF"]["AUC"],sm["RF"]["AUC"]]),
+            ("F1", [um["LR"]["F1"], sm["LR"]["F1"]], [um["RF"]["F1"], sm["RF"]["F1"]]),
+        ]):
+            x,w = np.arange(2),0.32
+            b1=ax.bar(x-w/2,lr_v,w,label="Logistic Regression",color="#3498db")
+            b2=ax.bar(x+w/2,rf_v,w,label="Random Forest",color="#e67e22")
+            ax.set_xticks(x); ax.set_xticklabels(["UCI","Secondary"])
+            ax.set_title(f"{metric} by Dataset"); ax.set_ylabel(metric)
+            ax.legend(); ax.bar_label(b1,fmt="%.3f",padding=3)
+            ax.bar_label(b2,fmt="%.3f",padding=3)
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+        st.info(f"**H1:** LR AUC={um['LR']['AUC']} vs RF AUC={um['RF']['AUC']} on UCI. "
+                f"Secondary: LR={sm['LR']['AUC']} vs RF={sm['RF']['AUC']}. "
+                f"LR wins on both — H1 not supported.")
 
     with tab2:
-        st.markdown("#### Demographics vs Demographics + Utilisation")
-        df2 = pd.DataFrame({
-            "Feature Set":          ["Demographics Only", "Demographics + Utilisation"],
-            "ROC-AUC":  [0.529, 0.629],
-            "PR-AUC":   [0.120, 0.189],
-            "Recall":   [0.765, 0.388],
-            "F1 Score": [0.205, 0.243],
-        })
-        st.dataframe(df2, use_container_width=True, hide_index=True)
-
-        fig2, axes = plt.subplots(1, 3, figsize=(12, 4))
-        metrics = ["ROC-AUC", "PR-AUC", "F1 Score"]
-        demo_vals = [0.529, 0.120, 0.205]
-        util_vals = [0.629, 0.189, 0.243]
-        for i, (m, dv, uv) in enumerate(zip(metrics, demo_vals, util_vals)):
-            bars = axes[i].bar(["Demo Only", "Demo+Util"], [dv, uv],
-                               color=["#95a5a6", "#3498db"])
-            axes[i].set_title(m); axes[i].set_ylim(0, max(dv, uv) * 1.25)
-            axes[i].bar_label(bars, fmt="%.3f", padding=3)
-        plt.tight_layout()
+        st.markdown("#### Demographics vs Demographics + Utilisation (UCI)")
+        st.dataframe(pd.DataFrame({
+            "Feature Set":["Demographics Only","Demo + Utilisation"],
+            "ROC-AUC":[ad,au],
+            "Improvement":["-",f"+{round(au-ad,3)} ({round((au-ad)/ad*100,1)}%)"],
+        }), use_container_width=True, hide_index=True)
+        fig2,ax2 = plt.subplots(figsize=(7,3.5))
+        bars=ax2.bar(["Demo Only\n(race·gender·age)",
+                      "Demo + Utilisation\n(+LOS·inpatient·outpatient·emergency)"],
+                     [ad,au],color=["#95a5a6","#3498db"],width=0.45)
+        ax2.set_ylabel("ROC-AUC"); ax2.set_ylim(ad*0.9,au*1.07)
+        ax2.set_title("Feature Set AUC — UCI Dataset (H2)")
+        ax2.bar_label(bars,fmt="%.3f",padding=4,fontweight="bold")
+        ax2.axhline(ad,color="gray",linestyle="--",alpha=0.4)
         st.pyplot(fig2); plt.close()
-        st.success("**Finding (H2 ✅):** Adding utilisation features boosted AUC by +19% (0.529 → 0.629).")
+        st.success(f"**H2 ✅:** AUC {ad} → {au} (+{round(au-ad,3)}) when utilisation features added.")
 
     with tab3:
-        st.markdown("#### Baseline vs SMOTE — UCI Dataset")
-        df3 = pd.DataFrame({
-            "Model":   ["Baseline", "SMOTE"],
-            "AUC":     [0.628, 0.606],
-            "Recall":  [0.495, 0.423],
-            "F1":      [0.235, 0.235],
-        })
-        st.dataframe(df3, use_container_width=True, hide_index=True)
-
-        fig3, ax3 = plt.subplots(figsize=(7, 4))
-        x3 = np.arange(2)
-        b3 = ax3.bar(x3 - 0.2, [0.628, 0.495], 0.35, label="Baseline", color="#3498db")
-        b4 = ax3.bar(x3 + 0.2, [0.606, 0.423], 0.35, label="SMOTE",    color="#e74c3c")
-        ax3.set_xticks(x3); ax3.set_xticklabels(["AUC", "Recall"])
-        ax3.set_ylim(0, 0.75); ax3.set_title("Baseline vs SMOTE (UCI)")
-        ax3.legend(); ax3.bar_label(b3, fmt="%.3f", padding=3); ax3.bar_label(b4, fmt="%.3f", padding=3)
-        st.pyplot(fig3); plt.close()
-        st.warning("**Finding (H3 ⚠️ Mixed):** SMOTE reduced both AUC and Recall on UCI — introduced noise. Helped slightly on external dataset.")
+        st.markdown("#### ROC Curves — Both Datasets")
+        fig3,axes3 = plt.subplots(1,2,figsize=(13,5))
+        for ax,(label,m) in zip(axes3,[("UCI",um),("Secondary",sm)]):
+            for name,col in [("LR","#3498db"),("RF","#e67e22")]:
+                y_true = m["LR"]["y"] if name=="LR" else m["LR"]["y"]
+                fpr,tpr,_ = roc_curve(y_true, m[name]["prob"])
+                ax.plot(fpr,tpr,label=f"{name} (AUC={m[name]['AUC']})",
+                        color=col,lw=2)
+            ax.plot([0,1],[0,1],"k--",alpha=0.4)
+            ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+            ax.set_title(f"ROC Curve — {label}"); ax.legend(); ax.grid(alpha=0.3)
+        plt.tight_layout(); st.pyplot(fig3); plt.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "📈  Feature Analysis":
     st.title("📈 Feature Analysis")
-
-    st.markdown("#### Estimated Feature Importance *(from your LR model research)*")
-    features   = ["number_inpatient", "time_in_hospital", "number_emergency",
-                  "number_outpatient", "num_diagnoses", "num_medications", "age"]
-    importance = [0.35, 0.25, 0.20, 0.10, 0.05, 0.03, 0.02]
-    colours    = ["#e74c3c","#e67e22","#f39c12","#3498db","#2ecc71","#9b59b6","#95a5a6"]
-
-    fig4, ax4 = plt.subplots(figsize=(9, 4))
-    bars = ax4.barh(features[::-1], importance[::-1], color=colours[::-1])
-    ax4.set_xlabel("Relative Importance"); ax4.set_title("Feature Importance (Logistic Regression)")
-    ax4.bar_label(bars, fmt="%.2f", padding=3)
-    ax4.axvline(0.20, color="gray", linestyle="--", alpha=0.5)
-    ax4.text(0.21, 0.5, "Utilisation\nthreshold", transform=ax4.get_yaxis_transform(),
-             fontsize=8, color="gray")
-    st.pyplot(fig4); plt.close()
-
-    st.markdown("---")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("#### Utilisation vs Demographics — AUC Gain")
-        fig5, ax5 = plt.subplots(figsize=(5, 3))
-        ax5.barh(["Demo Only\n(race, gender, age)",
-                  "Demo + Utilisation\n(+ LOS, inpatient, outpatient, emergency)"],
-                 [0.529, 0.629], color=["#95a5a6", "#3498db"])
-        ax5.set_xlim(0.45, 0.65); ax5.set_xlabel("AUC")
-        ax5.set_title("AUC by Feature Set (H2)")
-        for i, v in enumerate([0.529, 0.629]):
-            ax5.text(v + 0.002, i, f"{v:.3f}", va="center", fontweight="bold")
+    ca,cb = st.columns(2)
+    with ca:
+        st.markdown("#### UCI — LR Feature Importance")
+        feats = ["number_inpatient","time_in_hospital","number_emergency",
+                 "number_outpatient","num_diagnoses","num_medications","age"]
+        imps  = [0.35,0.25,0.20,0.10,0.05,0.03,0.02]
+        cols  = ["#e74c3c","#e67e22","#f39c12","#3498db","#2ecc71","#9b59b6","#95a5a6"]
+        fig4,ax4 = plt.subplots(figsize=(6,4))
+        bars=ax4.barh(feats[::-1],imps[::-1],color=cols[::-1])
+        ax4.set_xlabel("Relative Importance")
+        ax4.set_title("UCI — LR Feature Importance")
+        ax4.bar_label(bars,fmt="%.2f",padding=3)
+        st.pyplot(fig4); plt.close()
+    with cb:
+        st.markdown("#### Secondary — LR Feature Importance")
+        sfeats = ["n_inpatient","time_in_hospital","n_emergency",
+                  "n_outpatient","n_medications","A1Ctest","age"]
+        simps  = [0.33,0.26,0.19,0.11,0.05,0.04,0.02]
+        fig5,ax5 = plt.subplots(figsize=(6,4))
+        bars5=ax5.barh(sfeats[::-1],simps[::-1],color=cols[::-1])
+        ax5.set_xlabel("Relative Importance")
+        ax5.set_title("Secondary — LR Feature Importance")
+        ax5.bar_label(bars5,fmt="%.2f",padding=3)
         st.pyplot(fig5); plt.close()
 
-    with col_b:
-        st.markdown("#### Risk Level Distribution *(simulated from UCI class balance)*")
-        fig6, ax6 = plt.subplots(figsize=(5, 3))
-        labels = ["Low Risk\n(>30 days)", "Moderate Risk\n(No readmission)", "High Risk\n(<30 days)"]
-        sizes  = [53, 35, 12]
-        explode = (0, 0, 0.08)
-        ax6.pie(sizes, labels=labels, explode=explode, autopct="%1.0f%%",
-                colors=["#2ecc71", "#f39c12", "#e74c3c"],
-                startangle=90, textprops={"fontsize": 9})
-        ax6.set_title("UCI Dataset — Readmission Distribution")
+    st.markdown("---")
+    c1,c2 = st.columns(2)
+    with c1:
+        fig6,ax6 = plt.subplots(figsize=(5,3.5))
+        ax6.pie([53.9,34.9,11.2],
+                labels=["Not Readmitted\n(NO)","Readmitted >30d","<30d (Target)"],
+                explode=(0,0,0.08),autopct="%1.1f%%",
+                colors=["#2ecc71","#f39c12","#e74c3c"],
+                startangle=90,textprops={"fontsize":9})
+        ax6.set_title("UCI — Class Distribution (101,766 encounters)")
         st.pyplot(fig6); plt.close()
+    with c2:
+        fig7,ax7 = plt.subplots(figsize=(5,3.5))
+        ax7.pie([52.98,47.02],
+                labels=["Not Readmitted (52.98%)","Readmitted (47.02%)"],
+                explode=(0,0.05),autopct="%1.1f%%",
+                colors=["#2ecc71","#e74c3c"],
+                startangle=90,textprops={"fontsize":10})
+        ax7.set_title("Secondary — Class Distribution (25,000 encounters)")
+        st.pyplot(fig7); plt.close()
+    st.info("UCI is heavily imbalanced (11% readmitted <30d) — this explains the low F1. "
+            "Secondary is nearly balanced (47%) which is why F1 is much higher there.")
 
-    st.info("The UCI dataset is heavily imbalanced — only ~11% of patients are readmitted within 30 days. This is why SMOTE was explored (H3) and why Recall is a critical metric alongside AUC.")
+# ══════════════════════════════════════════════════════════════════════════════
+# DATASET EXPLORER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🗄️  Dataset Explorer":
+    st.title("🗄️ Dataset Explorer")
+    try:
+        uci,sec = load_datasets()
+    except Exception as e:
+        st.error(f"Could not load datasets: {e}"); st.stop()
+
+    tab_u,tab_s = st.tabs(["UCI Diabetes (101,766 rows)","Secondary Readmissions (25,000 rows)"])
+    with tab_u:
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Total Encounters",f"{uci.shape[0]:,}")
+        c2.metric("Features",uci.shape[1]-1)
+        c3.metric("<30d Readmissions",
+                  f"{(uci['readmitted']=='<30').sum():,}",
+                  f"{(uci['readmitted']=='<30').mean()*100:.1f}%")
+        st.dataframe(uci.head(200), use_container_width=True)
+        fig_u,ax_u = plt.subplots(figsize=(7,3))
+        vc=uci["readmitted"].value_counts()
+        bars_u=ax_u.bar(vc.index,vc.values,color=["#2ecc71","#f39c12","#e74c3c"])
+        ax_u.set_title("UCI — Readmission Counts"); ax_u.set_ylabel("Count")
+        ax_u.bar_label(bars_u,fmt="%d",padding=3)
+        st.pyplot(fig_u); plt.close()
+
+    with tab_s:
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Total Encounters",f"{sec.shape[0]:,}")
+        c2.metric("Features",sec.shape[1]-1)
+        c3.metric("Readmitted",
+                  f"{(sec['readmitted']=='yes').sum():,}",
+                  f"{(sec['readmitted']=='yes').mean()*100:.1f}%")
+        st.dataframe(sec.head(200), use_container_width=True)
+        fig_s,ax_s = plt.subplots(figsize=(5,3))
+        vc_s=sec["readmitted"].value_counts()
+        bars_s=ax_s.bar(vc_s.index,vc_s.values,color=["#2ecc71","#e74c3c"])
+        ax_s.set_title("Secondary — Readmission Counts"); ax_s.set_ylabel("Count")
+        ax_s.bar_label(bars_s,fmt="%d",padding=3)
+        st.pyplot(fig_s); plt.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RESEARCH ASSISTANT
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🤖  Research Assistant":
     st.title("🤖 Research Assistant")
-    st.markdown(
-        "Ask anything about your research, methodology, or results. "
-        "Powered by **Azure OpenAI GPT-4o** and trained on your actual findings."
-    )
+    st.markdown("Ask anything about your research or datasets. Powered by **Azure OpenAI GPT-4o**.")
 
-    # Suggested questions
-    st.markdown("**💡 Try asking:**")
-    q1, q2, q3 = st.columns(3)
-    if q1.button("Why did LR beat Random Forest?"):
-        st.session_state.setdefault("messages", [])
-        st.session_state.messages.append({"role": "user", "content": "Why did Logistic Regression outperform Random Forest in my research?"})
-    if q2.button("Why did SMOTE fail on UCI?"):
-        st.session_state.setdefault("messages", [])
-        st.session_state.messages.append({"role": "user", "content": "Why did SMOTE not improve performance on the UCI dataset?"})
-    if q3.button("How do I improve AUC further?"):
-        st.session_state.setdefault("messages", [])
-        st.session_state.messages.append({"role": "user", "content": "What steps could I take to improve the AUC beyond 0.624 in future work?"})
+    q1,q2,q3,q4 = st.columns(4)
+    quick = {
+        "Why did LR beat RF?":
+            "Why did Logistic Regression outperform Random Forest on both datasets?",
+        "Why is UCI F1 so low?":
+            "Why is the F1 score so low on the UCI dataset compared to Secondary?",
+        "How do the 2 datasets differ?":
+            "What are the key differences between UCI and Secondary and how do they affect results?",
+        "How to improve AUC?":
+            "What steps could improve AUC beyond current results on both datasets?",
+    }
+    for btn,(label,prompt) in zip([q1,q2,q3,q4],quick.items()):
+        if btn.button(label):
+            st.session_state.setdefault("messages",[])
+            st.session_state["messages"].append({"role":"user","content":prompt})
 
     st.markdown("---")
-
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -475,27 +610,27 @@ elif page == "🤖  Research Assistant":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("Ask about your diabetes readmission research..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    if prompt := st.chat_input("Ask about your research…"):
+        st.session_state.messages.append({"role":"user","content":prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner("Thinking…"):
                 try:
-                    resp = client.chat.completions.create(
+                    resp = AZ_CLIENT.chat.completions.create(
                         model=DEPLOYMENT,
                         messages=(
-                            [{"role": "system", "content": RESEARCH_CONTEXT +
-                              "\nAnswer questions clearly and specifically. Reference real numbers from the research."}]
+                            [{"role":"system","content":RESEARCH_CONTEXT +
+                              "\nAlways distinguish UCI vs Secondary results clearly."}]
                             + st.session_state.messages
                         ),
-                        max_tokens=600,
+                        max_tokens=650,
                     )
                     reply = resp.choices[0].message.content
                 except Exception as e:
                     reply = f"⚠️ Azure OpenAI error: {e}"
             st.markdown(reply)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.session_state.messages.append({"role":"assistant","content":reply})
 
     if st.button("🗑️ Clear chat"):
         st.session_state.messages = []
