@@ -387,7 +387,7 @@ elif page == "🔬  Patient Triage":
                     "State risk level clearly, reference the patient's most concerning "
                     "utilisation features, note which dataset is being used and what that "
                     "means for AUC reliability.",
-                    f"Assess 30-day readmission risk: {patient}")
+                    f"Assess 30-day readmission risk: {patient}", max_tokens=600))
             st.markdown(f'<div class="agent-box">{a1_out}</div>',unsafe_allow_html=True)
 
         st.markdown('<p class="section-hd">🔵 ExplainerAgent — Why is this patient at risk?</p>',unsafe_allow_html=True)
@@ -397,7 +397,7 @@ elif page == "🔬  Patient Triage":
                 "features most drive this patient's risk and why, referencing the finding that "
                 "utilisation features improved AUC from 0.529 to 0.629 on UCI. Be specific "
                 "about the actual feature values.",
-                f"Explain risk drivers: {patient}")
+                f"Explain risk drivers: {patient}", max_tokens=800)
         st.markdown(f'<div class="agent-box">{a2_out}</div>',unsafe_allow_html=True)
 
         st.markdown('<p class="section-hd">🟢 DischargeAdvisor — Personalised Discharge Plan</p>',unsafe_allow_html=True)
@@ -406,7 +406,7 @@ elif page == "🔬  Patient Triage":
                 "You are the DischargeAdvisor. Give 4 specific, empathetic, actionable "
                 "discharge recommendations to reduce 30-day readmission. Tailor to age group, "
                 "HbA1c level, prior visit history, and dataset context. Use plain language.",
-                f"Create discharge plan: {patient}. Risk: {level} ({risk_pct}%)",max_tokens=550)
+                f"Create discharge plan: {patient}. Risk: {level} ({risk_pct}%)",max_tokens=1500)
         st.success(a3_out)
         st.markdown("---")
         st.download_button("📥 Download Triage Report",
