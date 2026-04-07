@@ -195,14 +195,23 @@ st.set_page_config(page_title="DiabetesGuard AI",page_icon="🏥",
                    layout="wide",initial_sidebar_state="expanded")
 st.markdown("""
 <style>
-.agent-box{background:#eaf4fb;border-radius:10px;padding:16px;
-           margin-bottom:12px;border-left:4px solid #2980b9;}
+.agent-box{
+    background:#eaf4fb;
+    border-radius:10px;
+    padding:16px;
+    margin-bottom:12px;
+    border-left:4px solid #2980b9;
+    color:#1a1a2e !important;
+}
+.agent-box p, .agent-box li, .agent-box strong, .agent-box ul{
+    color:#1a1a2e !important;
+}
 .section-hd{font-size:1.05rem;font-weight:600;margin:10px 0 4px;}
 .tag-uci{background:#d6eaf8;color:#154360;padding:2px 8px;
          border-radius:10px;font-size:.8rem;font-weight:600;}
 .tag-sec{background:#d5f5e3;color:#145a32;padding:2px 8px;
          border-radius:10px;font-size:.8rem;font-weight:600;}
-</style>""",unsafe_allow_html=True)
+</style>""", unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
