@@ -393,7 +393,7 @@ elif page == "🔬  Patient Triage":
             ax.annotate("",xy=(0.38*np.cos(rad),0.38*np.sin(rad)),xytext=(0,0),
                         arrowprops=dict(arrowstyle="->",color="black",lw=2.5))
             ax.text(0,-0.28,f"{risk_pct}%",ha="center",fontsize=22,fontweight="bold",color="black")
-            ax.text(0,-0.55,f"{emoji} {level} Risk",ha="center",fontsize=11,color="black")
+            ax.text(0,-0.55,f"{level} Risk",ha="center",fontsize=11,color="black")
             ax.axis("off")
             st.pyplot(fig,use_container_width=True); plt.close()
             st.progress(risk_pct/100)
