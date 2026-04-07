@@ -181,14 +181,51 @@ def train_models():
     }
     return uci_m, sec_m, auc_demo, auc_util, uci, sec
 
-def compute_risk(inpatient,los,emergency,outpatient,diagnoses,medications,hba1c):
-    score=(inpatient*0.35+los*0.25+emergency*0.20+outpatient*0.10
-           +diagnoses*0.07+medications*0.03)
-    if hba1c in [">7",">8","high"]: score*=1.15
-    pct=min(int((score/14)*100),96)
-    if   pct>=60: return pct,"High",    "#e74c3c","🔴"
-    elif pct>=35: return pct,"Moderate","#f39c12","🟡"
-    else:         return pct,"Low",     "#27ae60","🟢"
+def compute_risk(inpatient, los, emergency, outpatient,
+                 diagnoses, medications, hba1c,
+                 age="[50-60)", race="Caucasian",
+                 insulin="No", gender="Female"):
+
+    # Base score from utilisation features (top LR weights)
+    score = (inpatient   * 0.35 +
+             los         * 0.25 +
+             emergency   * 0.20 +
+             outpatient  * 0.10 +
+             diagnoses   * 0.07 +
+             medications * 0.03)
+
+    # Age group multiplier — older = higher risk
+    age_multipliers = {
+        "[0-10)":  0.70, "[10-20)": 0.75, "[20-30)": 0.80,
+        "[30-40)": 0.85, "[40-50)": 0.90, "[50-60)": 1.00,
+        "[60-70)": 1.10, "[70-80)": 1.20, "[80-90)": 1.28,
+        "[90-100)":1.35,
+    }
+    score *= age_multipliers.get(age, 1.0)
+
+    # HbA1c penalty — poor glucose control increases risk
+    if hba1c in [">8", "high"]:
+        score *= 1.20
+    elif hba1c in [">7"]:
+        score *= 1.10
+
+    # Insulin instability — changed dosage signals unresolved glucose issues
+    if insulin in ["Up", "Down"]:
+        score *= 1.15
+    elif insulin in ["yes"]:
+        score *= 1.10
+
+    # Race — reflects documented UCI dataset disparities
+    if race == "AfricanAmerican":
+        score *= 1.10
+    elif race == "Hispanic":
+        score *= 1.05
+
+    pct = min(int((score / 14) * 100), 96)
+
+    if   pct >= 60: return pct, "High",     "#e74c3c", "🔴"
+    elif pct >= 35: return pct, "Moderate", "#f39c12", "🟡"
+    else:           return pct, "Low",      "#27ae60", "🟢"
 
 # ── Page config & style ───────────────────────────────────────────────────────
 st.set_page_config(page_title="DiabetesGuard AI",page_icon="🏥",
