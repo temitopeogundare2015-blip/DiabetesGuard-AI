@@ -366,8 +366,12 @@ elif page == "🔬  Patient Triage":
                                           use_container_width=True)
 
     if submitted:
-        risk_pct,level,colour,emoji = compute_risk(
-            inpatient,los,emergency,outpatient,diagnoses,medications,hba1c)
+        risk_pct,level,colour,emoji=compute_risk(
+        inpatient, los, emergency, outpatient,
+        diagnoses, medications, hba1c,
+        age=age, race=race if using_uci else "Caucasian",
+        insulin=insulin, gender=gender if using_uci else "Female"
+        )
         patient = {
             "dataset": "UCI" if using_uci else "Secondary",
             "age_group":age, "gender":gender if using_uci else "N/A",
