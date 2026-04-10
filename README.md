@@ -20,7 +20,7 @@ DiabetesGuard AI addresses a critical challenge in healthcare: identifying diabe
 
 ## 🔗 Live Demo
 
-> 🚀 **[diabetesguard-ai.streamlit.app](#)** *(replace with your deployed URL)*
+> 🚀 **[(https://diabetes-guard-ai.streamlit.app/)](#)** *(replace with your deployed URL)*
 
 ---
 
